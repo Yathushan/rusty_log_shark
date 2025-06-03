@@ -431,7 +431,8 @@ pub fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                 entry.original_line.clone()
             };
             report_lines.push(format!(
-                "[{}] {}",
+                "  [{}] [{}] {}",
+                entry.source.cyan(),
                 entry
                     .timestamp
                     .format("%Y-%m-%d %H:%M:%S")
