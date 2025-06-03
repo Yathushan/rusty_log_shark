@@ -10,6 +10,7 @@ use clap::Parser;
 use colored::*;
 use lazy_static::lazy_static;
 use regex::Regex;
+use serde::Deserialize;
 
 lazy_static! {
     // A list of (Regex to find the timestamp, Chrono format string) tuples.
@@ -61,10 +62,43 @@ struct CliArgs {
     output: Option<PathBuf>,
 }
 
+#[derive(Deserialize, Debug)]
+struct Config {
+    default_pattern: Option<String>,
+    // We could add more config options here in the future
+}
+
 struct LogEntry {
     timestamp: DateTime<Utc>,
     original_line: String,
     source_path: PathBuf,
+}
+
+// Helper function to load and parse the config file
+fn load_config() -> Option<Config> {
+    let config_filename = "log_shark.toml";
+    match std::fs::read_to_string(config_filename) {
+        Ok(content) => {
+            // File exists, try to parse it
+            match toml::from_str(&content) {
+                Ok(config) => Some(config),
+                Err(e) => {
+                    // File is malformed, print an error and exit
+                    eprintln!(
+                        "{} '{}': {}",
+                        "Error: Could not parse config file".red().bold(),
+                        config_filename,
+                        e
+                    );
+                    process::exit(1);
+                }
+            }
+        }
+        Err(_) => {
+            // File doesn't exist or couldn't be read, which is fine. Just return None.
+            None
+        }
+    }
 }
 
 // Helper function to parse a timestamp from a line using multiple formats
@@ -169,8 +203,18 @@ fn highlight_matches(line: &str, re: &Regex) -> String {
 fn main() {
     let args = CliArgs::parse();
 
-    let filter_regex = args.pattern.map(|p| {
-        Regex::new(&p).unwrap_or_else(|e| {
+    // --- NEW: CONFIGURATION LOGIC ---
+    // 1. Load config from `log_shark.toml` if it exists
+    let config = load_config();
+
+    // 2. Determine the final pattern to use based on priority
+    //    The .or() method on Option is perfect for this! It returns the first `Some` it finds.
+    let pattern_to_use = args.pattern.or(config.and_then(|c| c.default_pattern));
+    // .and_then() is used to safely get default_pattern from an Option<Config>
+
+    // 3. Compile the final pattern
+    let filter_regex = pattern_to_use.as_ref().map(|p| {
+        Regex::new(p).unwrap_or_else(|e| {
             eprintln!("Error: Invalid regex pattern: {}", e);
             process::exit(1);
         })

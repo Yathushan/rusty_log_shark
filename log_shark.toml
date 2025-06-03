@@ -1,0 +1,2 @@
+# My default pattern for finding important log entries.
+default_pattern = "(?i)(ERROR|WARN|CRITICAL)"
