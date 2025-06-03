@@ -10,11 +10,9 @@ use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use clap::{ArgGroup, Parser};
 use colored::*;
 use lazy_static::lazy_static;
+use rayon::prelude::*;
 use regex::Regex;
 use serde::Deserialize;
-
-// All structs and functions need to be `pub` if main.rs is to use them.
-// Add `pub` to all struct and helper function definitions.
 
 lazy_static! {
     // A list of (Regex to find the timestamp, Chrono format string) tuples.
@@ -139,28 +137,37 @@ pub fn parse_timestamp(line: &str) -> Option<DateTime<Utc>> {
 
 /// Helper function to parse an iterator of log lines into a vector of LogEntry structs.
 pub fn parse_lines<'a>(
-    lines: impl Iterator<Item = &'a str>,
-    source: &str, // A string identifier for the source (file path or container name)
+    lines: Vec<&'a str>, // We now take a Vec of string slices
+    source: &str,
     filter_regex: &Option<Regex>,
 ) -> Vec<LogEntry> {
-    let mut entries = Vec::new();
+    lines
+        .into_par_iter() // 1. Convert the vector into a parallel iterator
+        .filter_map(|line| {
+            // 2. Process each line in parallel
+            // This closure runs on many threads at once.
 
-    for line in lines {
-        if let Some(re) = filter_regex {
-            if !re.is_match(line) {
-                continue;
+            // First, check the filter pattern
+            if let Some(re) = filter_regex {
+                if !re.is_match(line) {
+                    return None; // Skip if it doesn't match
+                }
             }
-        }
 
-        if let Some(timestamp) = parse_timestamp(line) {
-            entries.push(LogEntry {
-                timestamp,
-                original_line: line.to_string(), // Convert line slice to owned String
-                source: source.to_string(),      // Convert source slice to owned String
-            });
-        }
-    }
-    entries
+            // Next, parse the timestamp
+            if let Some(timestamp) = parse_timestamp(line) {
+                // If successful, return a LogEntry
+                Some(LogEntry {
+                    timestamp,
+                    original_line: line.to_string(),
+                    source: source.to_string(),
+                })
+            } else {
+                // If no timestamp found, discard the line
+                None
+            }
+        })
+        .collect() // 3. Collect the results from all threads back into a single Vec
 }
 
 /// Helper function to open a log file, read its lines, and send them to the core parser.
@@ -175,9 +182,10 @@ fn parse_log_file(log_file_path: &Path, filter_regex: &Option<Regex>) -> Vec<Log
         let reader = BufReader::new(file);
         // We must collect lines into a Vec so the string data lives long enough.
         let lines: Vec<String> = reader.lines().filter_map(Result::ok).collect();
-        // Now call the core parser with an iterator over the collected lines.
+        // collect the lines into a Vec of &str before passing
+        let line_slices: Vec<&str> = lines.iter().map(AsRef::as_ref).collect();
         parse_lines(
-            lines.iter().map(AsRef::as_ref),
+            line_slices,
             &log_file_path.display().to_string(),
             filter_regex,
         )
@@ -300,7 +308,9 @@ pub fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         combined_output.extend_from_slice(&output.stderr);
         let logs_str = String::from_utf8_lossy(&combined_output);
 
-        all_entries.extend(parse_lines(logs_str.lines(), container, &filter_regex));
+        let lines: Vec<&str> = logs_str.lines().collect();
+
+        all_entries.extend(parse_lines(lines, container, &filter_regex));
     }
 
     eprintln!(
