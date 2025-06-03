@@ -145,6 +145,27 @@ fn parse_cli_timestamp(s: &str) -> DateTime<Utc> {
         .and_utc()
 }
 
+// Helper function to visualize matches in a string using ANSI escape codes.
+fn highlight_matches(line: &str, re: &Regex) -> String {
+    let mut result = String::new();
+    let mut last_end = 0;
+
+    for mat in re.find_iter(line) {
+        // Append the part of the string before the match
+        result.push_str(&line[last_end..mat.start()]);
+
+        // Append the matched part, highlighted
+        result.push_str(&mat.as_str().magenta().bold().to_string());
+
+        last_end = mat.end();
+    }
+
+    // Append the rest of the string after the final match
+    result.push_str(&line[last_end..]);
+
+    result
+}
+
 fn main() {
     let args = CliArgs::parse();
 
@@ -259,6 +280,11 @@ fn main() {
 
                 if args.show_matches {
                     for entry in log_group {
+                        let line_to_print = if let Some(re) = &filter_regex {
+                            highlight_matches(&entry.original_line, re)
+                        } else {
+                            entry.original_line.clone()
+                        };
                         report_lines.push(format!(
                             "  [{}] {}",
                             entry
@@ -266,7 +292,7 @@ fn main() {
                                 .format("%Y-%m-%d %H:%M:%S")
                                 .to_string()
                                 .dimmed(),
-                            entry.original_line
+                            line_to_print
                         ));
                     }
                 }
@@ -288,6 +314,11 @@ fn main() {
                 ));
                 last_path = Some(&entry.source_path);
             }
+            let line_to_print = if let Some(re) = &filter_regex {
+                highlight_matches(&entry.original_line, re)
+            } else {
+                entry.original_line.clone()
+            };
             report_lines.push(format!(
                 "[{}] {}",
                 entry
@@ -295,7 +326,7 @@ fn main() {
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string()
                     .dimmed(),
-                entry.original_line
+                line_to_print
             ));
         }
     }
