@@ -160,8 +160,8 @@ fn main() {
 
     let mut all_entries: Vec<LogEntry> = Vec::new();
 
-    println!("{}", "--- Log Collection Starting ---".magenta().bold());
-    // Collection logic remains the same...
+    // PROGRESS messages now go to stderr using eprintln!
+    eprintln!("{}", "--- Log Collection Starting ---".magenta().bold());
     for path_buf in &args.paths {
         if path_buf.is_file() {
             all_entries.extend(parse_log_file(path_buf.as_path(), &filter_regex));
@@ -178,38 +178,38 @@ fn main() {
         }
     }
 
-    println!(
+    eprintln!(
         "\n{} {} log entries collected.",
         "---".magenta(),
         all_entries.len().to_string().yellow()
     );
 
-    // Filtering logic remains the same...
     if let Some(after) = after_timestamp {
-        println!(
+        eprintln!(
             "Filtering for entries after {}...",
             after.to_string().yellow()
         );
         all_entries.retain(|entry| entry.timestamp > after);
     }
     if let Some(before) = before_timestamp {
-        println!(
+        eprintln!(
             "Filtering for entries before {}...",
             before.to_string().yellow()
         );
         all_entries.retain(|entry| entry.timestamp < before);
     }
 
-    println!("{}", "Sorting entries by timestamp...".blue());
+    eprintln!("{}", "Sorting entries by timestamp...".blue());
     all_entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-    // --- UPDATED AGGREGATION OR DISPLAY LOGIC ---
+    // --- REPORT GENERATION ---
+    // We will now build the report into a vector of strings.
+    let mut report_lines: Vec<String> = Vec::new();
+
     if let Some(unit) = args.group_by {
-        println!("\n{}", "--- Aggregation Report ---".green().bold());
+        report_lines.push(format!("\n{}", "--- Aggregation Report ---".green().bold()));
 
-        // The HashMap now stores a Vector of LogEntry references for each time bucket.
         let mut groups: HashMap<DateTime<Utc>, Vec<&LogEntry>> = HashMap::new();
-
         for entry in &all_entries {
             let truncated_ts = match unit.as_str() {
                 "hour" => entry
@@ -232,8 +232,6 @@ fn main() {
                     .unwrap(),
                 _ => unreachable!(),
             };
-
-            // Get the vector for this time bucket, create it if it doesn't exist, and push the log entry.
             groups
                 .entry(truncated_ts)
                 .or_insert_with(Vec::new)
@@ -252,18 +250,16 @@ fn main() {
                     "%Y-%m-%d"
                 };
 
-                // Print the header for this group with the count.
-                println!(
+                report_lines.push(format!(
                     "\n{:<25} {} {}",
                     key.format(format_str).to_string().cyan().bold(),
                     "|".green(),
                     format!("{} entries", count).yellow()
-                );
+                ));
 
-                // If --show-matches is used, print the lines in this group.
                 if args.show_matches {
                     for entry in log_group {
-                        println!(
+                        report_lines.push(format!(
                             "  [{}] {}",
                             entry
                                 .timestamp
@@ -271,26 +267,28 @@ fn main() {
                                 .to_string()
                                 .dimmed(),
                             entry.original_line
-                        );
+                        ));
                     }
                 }
             }
         }
     } else {
-        // This is the existing logic for when --group-by is NOT used
-        println!(
+        report_lines.push(format!(
             "\n{} {} filtered and sorted entries.",
             "---".green(),
             all_entries.len().to_string().yellow()
-        );
-        println!("{}", "--- Log Output ---".green().bold());
+        ));
+        report_lines.push(format!("{}", "--- Log Output ---".green().bold()));
         let mut last_path: Option<&PathBuf> = None;
         for entry in &all_entries {
             if last_path.map_or(true, |p| p != &entry.source_path) {
-                println!("\n// {}:", entry.source_path.display().to_string().cyan());
+                report_lines.push(format!(
+                    "\n// {}:",
+                    entry.source_path.display().to_string().cyan()
+                ));
                 last_path = Some(&entry.source_path);
             }
-            println!(
+            report_lines.push(format!(
                 "[{}] {}",
                 entry
                     .timestamp
@@ -298,8 +296,32 @@ fn main() {
                     .to_string()
                     .dimmed(),
                 entry.original_line
-            );
+            ));
         }
     }
-    println!("\n{}", "----------------------".green().bold());
+    report_lines.push(format!("\n{}", "----------------------".green().bold()));
+
+    // --- FINAL OUTPUT HANDLING ---
+    // Now, either print the report to the console or save it to a file.
+    let final_report = report_lines.join("\n");
+
+    if let Some(output_path) = args.output {
+        eprintln!(
+            "{} '{}'",
+            "Saving report to".blue(),
+            output_path.display().to_string().cyan()
+        );
+        match std::fs::write(&output_path, final_report) {
+            Ok(_) => eprintln!("{}", "Report saved successfully.".green()),
+            Err(e) => eprintln!(
+                "{} '{}': {}",
+                "Error: Could not write to file".red().bold(),
+                output_path.display(),
+                e
+            ),
+        }
+    } else {
+        // If no --output flag, print the report to the console
+        println!("{}", final_report);
+    }
 }
