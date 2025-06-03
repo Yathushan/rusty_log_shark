@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use colored::*;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -20,6 +20,8 @@ lazy_static! {
     // A list of (Regex to find the timestamp, Chrono format string) tuples.
     // We will try these in order until one successfully parses.
     static ref TIMESTAMP_FORMATS: Vec<(Regex, &'static str)> = vec![
+        // Docker Format: {"level":"info",..."time":"2025-05-22T12:09:16Z",...}
+        (Regex::new(r#""time":"([^"]+)""#).unwrap(), "%Y-%m-%dT%H:%M:%SZ"),
         // Format: [2025-06-01 19:33:40]
         (Regex::new(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]").unwrap(), "%Y-%m-%d %H:%M:%S"),
         // Format: Thu Jun 09 06:07:04 2005
@@ -36,10 +38,19 @@ lazy_static! {
 /// A smart CLI tool to analyse, sort, and filter log files.
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
+#[command(group(
+    ArgGroup::new("input")
+        .required(true)
+        .args(["paths", "docker"]),
+))]
 pub struct CliArgs {
     /// One or more log file paths or directories to analyse.
     #[arg(required = true, num_args = 1..)] // Ensures at least one path is given
     paths: Vec<PathBuf>, // Changed to Vec<PathBuf> to handle multiple paths
+
+    /// One or more Docker container names or IDs to read logs from.
+    #[arg(long, short = 'd')]
+    pub docker: Vec<String>,
 
     /// Optional REGEX pattern to search for in log lines.
     #[arg(short, long)]
@@ -75,9 +86,9 @@ pub struct Config {
 /// Represents a single parsed log entry with its timestamp and content.
 #[derive(Debug)]
 pub struct LogEntry {
-    timestamp: DateTime<Utc>,
-    original_line: String,
-    source_path: PathBuf,
+    pub timestamp: DateTime<Utc>,
+    pub original_line: String,
+    pub source: String,
 }
 
 // Helper function to load and parse the config file
@@ -112,57 +123,67 @@ pub fn parse_timestamp(line: &str) -> Option<DateTime<Utc>> {
     for (regex, format_str) in TIMESTAMP_FORMATS.iter() {
         if let Some(captures) = regex.captures(line) {
             if let Some(timestamp_match) = captures.get(1) {
-                // FIX #3: Use the modern, non-deprecated method for parsing
+                // Try to parse the captured string with the corresponding format.
+                // If it succeeds, return the DateTime immediately.
                 if let Ok(naive_dt) =
                     NaiveDateTime::parse_from_str(timestamp_match.as_str(), format_str)
                 {
-                    // Assume UTC for naive datetimes. For timestamps without a year,
-                    // chrono might default to a placeholder, so handling might be needed for real-world use.
-                    // For now, we'll let chrono decide the year if not present.
                     return Some(naive_dt.and_utc());
                 }
             }
         }
     }
-    None // Return None if no format matches
+    // If no format matched, return None.
+    None
 }
 
-// Helper function to parse a file and returns a list of LogEntry structs
-pub fn parse_log_file(log_file_path: &Path, filter_regex: &Option<Regex>) -> Vec<LogEntry> {
-    println!(
+/// Helper function to parse an iterator of log lines into a vector of LogEntry structs.
+pub fn parse_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    source: &str, // A string identifier for the source (file path or container name)
+    filter_regex: &Option<Regex>,
+) -> Vec<LogEntry> {
+    let mut entries = Vec::new();
+
+    for line in lines {
+        if let Some(re) = filter_regex {
+            if !re.is_match(line) {
+                continue;
+            }
+        }
+
+        if let Some(timestamp) = parse_timestamp(line) {
+            entries.push(LogEntry {
+                timestamp,
+                original_line: line.to_string(), // Convert line slice to owned String
+                source: source.to_string(),      // Convert source slice to owned String
+            });
+        }
+    }
+    entries
+}
+
+/// Helper function to open a log file, read its lines, and send them to the core parser.
+fn parse_log_file(log_file_path: &Path, filter_regex: &Option<Regex>) -> Vec<LogEntry> {
+    eprintln!(
         "{} {}",
         "Processing file:".blue(),
         log_file_path.display().to_string().cyan()
     );
 
-    let mut entries = Vec::new();
-    let file = match File::open(log_file_path) {
-        Ok(f) => f,
-        Err(_) => return entries, // Return empty list if file can't be opened
-    };
-
-    let reader = BufReader::new(file);
-
-    for line_result in reader.lines() {
-        if let Ok(line) = line_result {
-            // First, check if the line matches the filter pattern, if one is provided
-            if let Some(re) = filter_regex {
-                if !re.is_match(&line) {
-                    continue; // Skip lines that don't match the pattern
-                }
-            }
-
-            // Next, try to parse the timestamp from the line
-            if let Some(timestamp) = parse_timestamp(&line) {
-                entries.push(LogEntry {
-                    timestamp,
-                    original_line: line,
-                    source_path: log_file_path.to_path_buf(),
-                });
-            }
-        }
+    if let Ok(file) = File::open(log_file_path) {
+        let reader = BufReader::new(file);
+        // We must collect lines into a Vec so the string data lives long enough.
+        let lines: Vec<String> = reader.lines().filter_map(Result::ok).collect();
+        // Now call the core parser with an iterator over the collected lines.
+        parse_lines(
+            lines.iter().map(AsRef::as_ref),
+            &log_file_path.display().to_string(),
+            filter_regex,
+        )
+    } else {
+        Vec::new() // Return empty vector if file can't be opened
     }
-    entries
 }
 
 // Helper function to parse the timestamp strings provided by the user via the CLI.
@@ -249,6 +270,37 @@ pub fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    }
+
+    // --- Process Docker containers (if any) ---
+    for container in &args.docker {
+        eprintln!(
+            "{} {}",
+            "Fetching logs for container:".blue(),
+            container.cyan()
+        );
+        let output = std::process::Command::new("docker")
+            .arg("logs")
+            .arg(container)
+            .output()?;
+
+        if !output.status.success() {
+            let error_message = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "{} '{}': {}",
+                "Error fetching docker logs for".red().bold(),
+                container,
+                error_message
+            );
+            continue;
+        }
+
+        // Combine stdout and stderr to capture all logs.
+        let mut combined_output = output.stdout;
+        combined_output.extend_from_slice(&output.stderr);
+        let logs_str = String::from_utf8_lossy(&combined_output);
+
+        all_entries.extend(parse_lines(logs_str.lines(), container, &filter_regex));
     }
 
     eprintln!(
@@ -357,14 +409,11 @@ pub fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             all_entries.len().to_string().yellow()
         ));
         report_lines.push(format!("{}", "--- Log Output ---".green().bold()));
-        let mut last_path: Option<&PathBuf> = None;
+        let mut last_source: Option<&String> = None;
         for entry in &all_entries {
-            if last_path.map_or(true, |p| p != &entry.source_path) {
-                report_lines.push(format!(
-                    "\n// {}:",
-                    entry.source_path.display().to_string().cyan()
-                ));
-                last_path = Some(&entry.source_path);
+            if last_source.map_or(true, |p| p != &entry.source) {
+                report_lines.push(format!("\n// {}:", entry.source.cyan()));
+                last_source = Some(&entry.source);
             }
             let line_to_print = if let Some(re) = &filter_regex {
                 highlight_matches(&entry.original_line, re)
